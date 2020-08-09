@@ -1,6 +1,7 @@
 require 'digest/sha1'
 require 'mysql2'
 require 'sinatra/base'
+require 'redis'
 
 class App < Sinatra::Base
   configure do
@@ -9,6 +10,9 @@ class App < Sinatra::Base
     set :avatar_max_size, 1 * 1024 * 1024
 
     enable :sessions
+
+    redis = Redis.new
+    Redis.current = redis
   end
 
   configure :development do
@@ -31,6 +35,10 @@ class App < Sinatra::Base
 
       @_user
     end
+
+    def redis
+      @redis ||= Redis.current
+    end
   end
 
   get '/initialize' do
@@ -39,6 +47,10 @@ class App < Sinatra::Base
     db.query("DELETE FROM channel WHERE id > 10")
     db.query("DELETE FROM message WHERE id > 10000")
     db.query("DELETE FROM haveread")
+
+    redis.flushall
+
+    initialize_channel_message_count
     204
   end
 
@@ -211,9 +223,11 @@ class App < Sinatra::Base
     end
     @messages.reverse!
 
-    statement = db.prepare('SELECT COUNT(*) as cnt FROM message WHERE channel_id = ?')
-    cnt = statement.execute(@channel_id).first['cnt'].to_f
-    statement.close
+    # statement = db.prepare('SELECT COUNT(*) as cnt FROM message WHERE channel_id = ?')
+    # cnt = statement.execute(@channel_id).first['cnt'].to_f
+    # statement.close
+    cnt = channel_message_count(@channel_id).to_f
+
     @max_page = cnt == 0 ? 1 :(cnt / n).ceil
 
     return 400 if @page > @max_page
@@ -241,7 +255,7 @@ class App < Sinatra::Base
     @self_profile = user['id'] == @user['id']
     erb :profile
   end
-  
+
   get '/add_channel' do
     if user.nil?
       return redirect '/login', 303
@@ -336,6 +350,21 @@ class App < Sinatra::Base
 
   private
 
+  def initialize_channel_message_count
+    channel_count = db.prepare('SELECT channel_id, COUNT(*) AS cnt FROM message GROUP BY channel_id').execute
+    # For debug
+    puts channel_count.map{ |h| ["channel_message_count:#{h['channel_id']}", h['cnt']]}.flatten
+    redis.mset channel_count.map{|h| ["channel_message_count:#{h['channel_id']}", h['cnt']]}.flatten
+  end
+
+  def channel_message_count(channel_id)
+    redis.get "channel_message_count:#{channel_id}"
+  end
+
+  def count_up_channel_message_count(channel_id)
+    redis.incr "channel_message_count:#{channel_id}"
+  end
+
   def db
     return @db_client if defined?(@db_client)
 
@@ -362,6 +391,9 @@ class App < Sinatra::Base
     statement = db.prepare('INSERT INTO message (channel_id, user_id, content, created_at) VALUES (?, ?, ?, NOW())')
     messages = statement.execute(channel_id, user_id, content)
     statement.close
+
+    count_up_channel_message_count(channel_id)
+
     messages
   end
 
